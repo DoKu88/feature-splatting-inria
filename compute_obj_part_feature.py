@@ -287,13 +287,18 @@ def main(args):
 
         # visualize bbox
         viz_img = image.copy()
+        bboxes_for_save = []
         for bbox_idx in range(input_boxes1.shape[0]):
             bbox = input_boxes1[bbox_idx]
             bbox_xyxy = bbox.cpu().numpy().astype(int)
+            bboxes_for_save.append(bbox_xyxy)
             cv2.rectangle(viz_img, (bbox_xyxy[0], bbox_xyxy[1]), (bbox_xyxy[2], bbox_xyxy[3]), (0, 255, 0), 2)
             cv2.putText(viz_img, f'{bbox_idx}', (bbox_xyxy[0], bbox_xyxy[1]), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         save_img_path = obj_feat_path_list[i].replace('.npy', '_bbox.png')
         Image.fromarray(viz_img).save(save_img_path)
+        # Save bounding boxes as .npy
+        bbox_save_path = obj_feat_path_list[i].replace('.npy', '_bboxes.npy')
+        np.save(bbox_save_path, np.stack(bboxes_for_save))
 
         # crop images from bbox
         cropped_image_list = []

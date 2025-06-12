@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from sklearn.decomposition import PCA
+import argparse
 
 def load_mask(mask_path):
     # Loads a mask png (H, W, 4) and returns a binary mask (N, H, W) for each object
@@ -46,6 +47,18 @@ def compute_object_clip_embeddings(image_path, mask_path, output_dir, device="cu
         print(f"No objects found in mask: {mask_path}")
         return
 
+    # Try to load bounding boxes
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    bbox_path = os.path.join(output_dir, f"{base_name}_bboxes.npy")
+    if not os.path.exists(bbox_path):
+        bbox_path = mask_path.replace('_mask.png', '_bboxes.npy')
+    bboxes = None
+    if os.path.exists(bbox_path):
+        bboxes = np.load(bbox_path)
+        if bboxes.shape[0] != masks.shape[0]:
+            print(f"Warning: Number of bboxes ({bboxes.shape[0]}) does not match number of masks ({masks.shape[0]}) for {image_path}. Falling back to mask-based bbox.")
+            bboxes = None
+
     # Load CLIP model
     model, preprocess = get_clip_model()
     model = model.to(device)
@@ -59,12 +72,15 @@ def compute_object_clip_embeddings(image_path, mask_path, output_dir, device="cu
     ])
 
     for obj_idx, obj_mask in enumerate(masks):
-        # Get bounding box of the object
-        ys, xs = np.where(obj_mask)
-        if len(xs) == 0 or len(ys) == 0:
-            continue
-        x0, x1 = xs.min(), xs.max()
-        y0, y1 = ys.min(), ys.max()
+        # Use bbox from file if available, otherwise compute from mask
+        if bboxes is not None:
+            x0, y0, x1, y1 = bboxes[obj_idx]
+        else:
+            ys, xs = np.where(obj_mask)
+            if len(xs) == 0 or len(ys) == 0:
+                continue
+            x0, x1 = xs.min(), xs.max()
+            y0, y1 = ys.min(), ys.max()
         # Crop the image and mask to the bounding box
         crop_img = image.crop((x0, y0, x1+1, y1+1))
         crop_mask = obj_mask[y0:y1+1, x0:x1+1]
@@ -85,7 +101,6 @@ def compute_object_clip_embeddings(image_path, mask_path, output_dir, device="cu
         obj_feat_map[:, obj_mask] = feat_np[:, None]
 
         # Save the pixel-wise embedding as .npy
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
         npy_save_path = os.path.join(output_dir, f"{base_name}_obj{obj_idx}_clip_feat.npy")
         np.save(npy_save_path, obj_feat_map)
 
@@ -108,19 +123,57 @@ def compute_object_clip_embeddings(image_path, mask_path, output_dir, device="cu
 
 def process_all_masks(image_dir, mask_dir, output_dir, device="cuda"):
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Try to find images in 'images' or 'color' subdirectories
+    possible_image_dirs = [
+        os.path.join(image_dir, 'images'),
+        os.path.join(image_dir, 'color'),
+        image_dir  # fallback to the provided directory
+    ]
+    
+    image_dir = None
+    for dir_path in possible_image_dirs:
+        if os.path.exists(dir_path):
+            image_dir = dir_path
+            print(f"Found images in: {dir_path}")
+            break
+    
+    if image_dir is None:
+        raise ValueError(f"No image directory found in {image_dir}. Tried: {possible_image_dirs}")
+
     for fname in os.listdir(mask_dir):
         if fname.endswith("_mask.png"):
             mask_path = os.path.join(mask_dir, fname)
             base_name = fname.replace("_mask.png", "")
             # Try to find the corresponding image
+            image_found = False
             for ext in [".png", ".jpg", ".jpeg"]:
                 image_path = os.path.join(image_dir, base_name + ext)
                 if os.path.exists(image_path):
+                    image_found = True
                     break
-            else:
-                print(f"Image for mask {fname} not found.")
+            if not image_found:
+                print(f"Image for mask {fname} not found in {image_dir}.")
                 continue
             compute_object_clip_embeddings(image_path, mask_path, output_dir, device=device)
+
+def main():
+    parser = argparse.ArgumentParser(description="Compute object CLIP embeddings and PCA visualizations from masks.")
+    parser.add_argument('--image_dir', type=str, required=True, help='Directory containing input images')
+    parser.add_argument('--mask_dir', type=str, required=True, help='Directory containing mask images (e.g., *_mask.png)')
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save output features and visualizations')
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
+    args = parser.parse_args()
+
+    process_all_masks(
+        image_dir=args.image_dir,
+        mask_dir=args.mask_dir,
+        output_dir=args.output_dir,
+        device=args.device
+    )
+
+if __name__ == "__main__":
+    main()
 
 # Example usage:
 # process_all_masks(
