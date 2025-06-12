@@ -264,6 +264,54 @@ def process_object_level_features(image, sam_masks, clip_model, raw_transform, d
     np.save(obj_feat_path, aggregated_feat_map.cpu().detach().numpy())
     return aggregated_feat_map
 
+def process_object_level_features_mask(image, sam_masks, clip_model, raw_transform, device, 
+                                     obj_feat_path, object_H, object_W, final_H, final_W):
+    """Process object-level CLIP features where each mask region has its own unique CLIP embedding."""
+    raw_input_image = raw_transform(Image.fromarray(image))
+    whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
+    clip_feat_shape = whole_image_feature.shape[0]
+    
+    # Interpolate CLIP features to image size
+    resized_clip_feat_map_bchw = torch.nn.functional.interpolate(
+        whole_image_feature.unsqueeze(0).float(),
+        size=(object_H, object_W),
+        mode='bilinear',
+        align_corners=False
+    )
+    
+    mask_tensor_bchw = sam_masks.unsqueeze(1)
+    resized_mask_tensor_bchw = torch.nn.functional.interpolate(
+        mask_tensor_bchw.float(),
+        size=(object_H, object_W),
+        mode='nearest'
+    ).bool()
+    
+    # Create a new feature map where each mask region will have its own unique CLIP embedding
+    mask_feat_map = torch.zeros((clip_feat_shape, object_H, object_W), dtype=torch.float32, device=device)
+    
+    # For each mask, calculate its average CLIP embedding and assign it to the entire mask region
+    for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
+        # Get the mask region
+        mask_region = resized_mask_tensor_bchw[mask_idx, 0]
+        
+        # Calculate average CLIP embedding for this mask region
+        mask_clip_feat = resized_clip_feat_map_bchw[0, :, mask_region]
+        mask_avg_feat = mask_clip_feat.mean(dim=1).to(torch.float32)  # Ensure float32 dtype
+        
+        # Assign this average embedding to the entire mask region
+        mask_feat_map[:, mask_region] = mask_avg_feat[:, None]
+    
+    # Interpolate to final resolution
+    mask_feat_map = F.interpolate(
+        mask_feat_map[None], 
+        (final_H, final_W), 
+        mode='bilinear', 
+        align_corners=False
+    )[0]
+    
+    np.save(obj_feat_path, mask_feat_map.cpu().detach().numpy())
+    return mask_feat_map
+
 def process_part_level_features(image, bbox_xyxy_list, clip_model, part_transform, device, part_feat_path, 
                               small_H, small_W, final_H, final_W, part_batch_size, clip_feat_shape):
     """Process part-level CLIP features."""
@@ -318,7 +366,7 @@ def process_part_level_features(image, bbox_xyxy_list, clip_model, part_transfor
     np.save(part_feat_path, aggregated_feat_map.cpu().numpy())
     return aggregated_feat_map
 
-def save_visualizations(image, sam_mask, input_boxes1, obj_feat_path, aggregated_feat_map):
+def save_visualizations(image, sam_mask, input_boxes1, obj_feat_path, aggregated_feat_map, mask_feat_map):
     """Save various visualizations for debugging and analysis."""
     # Save SAM mask visualization
     annotation = sam_mask
@@ -349,7 +397,7 @@ def save_visualizations(image, sam_mask, input_boxes1, obj_feat_path, aggregated
     # Save PCA visualization
     original_size = (image.shape[1], image.shape[0])
     visualize_aggregated_feat_map(aggregated_feat_map, obj_feat_path.replace('.npy', '_clip_pca.png'), original_size)
-
+    visualize_aggregated_feat_map(mask_feat_map, obj_feat_path.replace('.npy', '_mask_clip_pca.png'), original_size)
 def setup_directories(args):
     """Setup all necessary directories for output."""
     os.makedirs(args.output_path, exist_ok=True)
@@ -446,6 +494,9 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
         device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
         dims['final_H'], dims['final_W']
     )
+
+    mask_feat_map = process_object_level_features_mask(image, sam_masks, models['clip_model'], transforms['raw_transform'], device, 
+                                     output_paths['obj_feat_path'], dims['object_H'], dims['object_W'], dims['final_H'], dims['final_W'])
     
     # Process part-level features
     bbox_xyxy_list = [bbox.cpu().numpy().astype(int) for bbox in input_boxes1]
@@ -458,7 +509,7 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     # Save visualizations
     save_visualizations(
         image, sam_masks, input_boxes1, 
-        output_paths['obj_feat_path'], aggregated_feat_map
+        output_paths['obj_feat_path'], aggregated_feat_map, mask_feat_map
     )
 
 def main(args):
