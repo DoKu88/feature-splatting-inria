@@ -148,17 +148,14 @@ def setup_models(args, device):
     mobilesamv2.to(device=device)
     mobilesamv2.eval()
     
-    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-    dinov2 = dinov2.to(device)
-    
     return {
         'clip_model': clip_model,
         'mobilesamv2': mobilesamv2,
         'ObjAwareModel': ObjAwareModel,
         'predictor': predictor,
-        'dinov2': dinov2
     }
 
+'''
 def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_feat_path, dino_resolution):
     """Process DINOv2 features for a single image."""
     image = Image.open(image_path)
@@ -175,6 +172,7 @@ def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_f
     features_chw = features_hwc.transpose((2, 0, 1))
     
     np.save(dinov2_feat_path, features_chw)
+'''
 
 # Object Aware Model is a YOLO model that is used to detect objects in an image
 def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou, sam_size):
@@ -359,8 +357,6 @@ def setup_directories(args):
     os.makedirs(args.obj_clip_feat_dir, exist_ok=True)
     args.part_clip_feat_dir = os.path.join(args.output_path, 'part_level_features')
     os.makedirs(args.part_clip_feat_dir, exist_ok=True)
-    args.dinov2_feat_dir = os.path.join(args.output_path, 'dinov2_vits14')
-    os.makedirs(args.dinov2_feat_dir, exist_ok=True)
     return args
 
 def get_image_directory(base_dir):
@@ -384,18 +380,15 @@ def setup_output_paths(image_paths, args):
     """Setup output paths for all features."""
     obj_feat_path_list = []
     part_feat_path_list = []
-    dinov2_feat_path_list = []
     
     for image_path in image_paths:
         feat_fn = os.path.splitext(os.path.basename(image_path))[0] + '.npy'
         obj_feat_path = os.path.join(args.obj_clip_feat_dir, feat_fn)
         part_feat_path = os.path.join(args.part_clip_feat_dir, feat_fn)
-        dinov2_feat_path = os.path.join(args.dinov2_feat_dir, feat_fn)
         obj_feat_path_list.append(obj_feat_path)
         part_feat_path_list.append(part_feat_path)
-        dinov2_feat_path_list.append(dinov2_feat_path)
     
-    return obj_feat_path_list, part_feat_path_list, dinov2_feat_path_list
+    return obj_feat_path_list, part_feat_path_list
 
 def preprocess_image(image_path, sam_size):
     """Load and preprocess an image for SAM processing."""
@@ -481,19 +474,7 @@ def main(args):
     # Get image paths
     image_dir = get_image_directory(args.source_path)
     image_paths = get_image_paths(image_dir)
-    obj_feat_path_list, part_feat_path_list, dinov2_feat_path_list = setup_output_paths(image_paths, args)
-    
-    # Process DINOv2 features
-    # Save the DINOv2 features for each image within a .npy file 
-    print("Processing DINOv2 features...")
-    for i in trange(len(image_paths)):
-        process_dinov2_features(
-            image_paths[i], models['dinov2'], transforms['dino_transform'],
-            device, dinov2_feat_path_list[i], args.dino_resolution
-        )
-    
-    del models['dinov2']
-    pytorch_gc()
+    obj_feat_path_list, part_feat_path_list = setup_output_paths(image_paths, args)
     
     # Process each image
     for i in trange(len(image_paths)):
@@ -517,7 +498,6 @@ if __name__ == "__main__":
     parser.add_argument("--obj_feat_res", type=int, default=100, help="Intermediate (for MAP) SAM-enhanced Object-level feature resolution")
     parser.add_argument("--part_feat_res", type=int, default=400, help="Intermediate (for MAP) SAM-enhanced Part-level feature resolution")
     parser.add_argument("--final_feat_res", type=int, default=64, help="Final hierarchical CLIP feature resolution")
-    parser.add_argument("--dino_resolution", type=int, default=800, help="Longest edge for DINOv2 feature generation")
     parser.add_argument("--mobilesamv2_encoder_name", type=str, default="mobilesamv2_efficientvit_l2", help="MobileSAMV2 encoder name")
     args = parser.parse_args()
 
