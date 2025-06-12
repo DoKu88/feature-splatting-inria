@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from tqdm import tqdm, trange
 import cv2
-from typing import Any, Dict, Generator,List
+from typing import Any, Dict, Generator, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -100,19 +100,16 @@ def visualize_aggregated_feat_map(aggregated_feat_map, save_path, original_size=
         img = img.resize(original_size, Image.NEAREST)
     img.save(save_path)
 
-def main(args):
+def setup_transforms(args):
+    """Setup all necessary transforms for different models."""
     norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    yolo_iou = 0.9
-    yolo_conf = 0.4
-
-    # For part-level CLIP
-    transform = T.Compose([
+    
+    part_transform = T.Compose([
         T.Resize((args.part_resolution, args.part_resolution)),
         T.ToTensor(),
         norm
     ])
 
-    # For object-level CLIP
     raw_transform = T.Compose([
         T.ToTensor(),
         norm
@@ -122,237 +119,290 @@ def main(args):
         T.ToTensor(),
         T.Normalize(mean=[0.5], std=[0.5]),
     ])
+    
+    return part_transform, raw_transform, dino_transform
 
+def setup_models(args, device):
+    """Initialize and setup all required models."""
     clip_model = MaskCLIPFeaturizer().cuda().eval()
-
+    
     mobilesamv2, ObjAwareModel, predictor = torch.hub.load("RogerQi/MobileSAMV2", args.mobilesamv2_encoder_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     mobilesamv2.to(device=device)
     mobilesamv2.eval()
+    
+    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+    dinov2 = dinov2.to(device)
+    
+    return clip_model, mobilesamv2, ObjAwareModel, predictor, dinov2
 
+def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_feat_path):
+    """Process DINOv2 features for a single image."""
+    image = Image.open(image_path)
+    image = resize_image(image, args.dino_resolution)
+    image = dino_transform(image)[:3].unsqueeze(0)
+    image, target_H, target_W = interpolate_to_patch_size(image, dinov2.patch_size)
+    image = image.cuda()
+    
+    with torch.no_grad():
+        features = dinov2.forward_features(image)["x_norm_patchtokens"][0]
+    
+    features = features.cpu().numpy()
+    features_hwc = features.reshape((target_H // dinov2.patch_size, target_W // dinov2.patch_size, -1))
+    features_chw = features_hwc.transpose((2, 0, 1))
+    
+    np.save(dinov2_feat_path, features_chw)
+
+def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou):
+    """Process SAM masks for object detection."""
+    obj_results = ObjAwareModel(image, device=device, imgsz=args.sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
+    
+    predictor.set_image(image)
+    input_boxes1 = obj_results[0].boxes.xyxy
+    input_boxes = input_boxes1.cpu().numpy()
+    input_boxes = predictor.transform.apply_boxes(input_boxes, predictor.original_size)
+    input_boxes = torch.from_numpy(input_boxes).cuda()
+    
+    sam_mask = []
+    image_embedding = predictor.features
+    image_embedding = torch.repeat_interleave(image_embedding, 320, dim=0)
+    prompt_embedding = mobilesamv2.prompt_encoder.get_dense_pe()
+    prompt_embedding = torch.repeat_interleave(prompt_embedding, 320, dim=0)
+    
+    for (boxes,) in batch_iterator(320, input_boxes):
+        with torch.no_grad():
+            image_embedding = image_embedding[0:boxes.shape[0],:,:,:]
+            prompt_embedding = prompt_embedding[0:boxes.shape[0],:,:,:]
+            sparse_embeddings, dense_embeddings = mobilesamv2.prompt_encoder(
+                points=None,
+                boxes=boxes,
+                masks=None,)
+            low_res_masks, _ = mobilesamv2.mask_decoder(
+                image_embeddings=image_embedding,
+                image_pe=prompt_embedding,
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+                simple_type=True,
+            )
+            low_res_masks = predictor.model.postprocess_masks(low_res_masks, predictor.input_size, predictor.original_size)
+            sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold)*1.0
+            sam_mask.append(sam_mask_pre.squeeze(1))
+    
+    return torch.cat(sam_mask), input_boxes1
+
+def process_object_level_features(image, sam_mask, clip_model, raw_transform, device, obj_feat_path, final_H, final_W):
+    """Process object-level CLIP features."""
+    raw_input_image = raw_transform(Image.fromarray(image))
+    whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
+    clip_feat_shape = whole_image_feature.shape[0]
+    
+    # Interpolate CLIP features to image size
+    resized_clip_feat_map_bchw = torch.nn.functional.interpolate(
+        whole_image_feature.unsqueeze(0).float(),
+        size=(object_H, object_W),
+        mode='bilinear',
+        align_corners=False
+    )
+    
+    mask_tensor_bchw = sam_mask.unsqueeze(1)
+    resized_mask_tensor_bchw = torch.nn.functional.interpolate(
+        mask_tensor_bchw.float(),
+        size=(object_H, object_W),
+        mode='nearest'
+    ).bool()
+    
+    aggregated_feat_map = torch.zeros((clip_feat_shape, object_H, object_W), dtype=float, device=device)
+    aggregated_feat_cnt_map = torch.zeros((object_H, object_W), dtype=int, device=device)
+    
+    for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
+        aggregared_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask_tensor_bchw[mask_idx, 0]]
+        aggregared_clip_feat = aggregared_clip_feat.mean(dim=1)
+        
+        aggregated_feat_map[:, resized_mask_tensor_bchw[mask_idx, 0]] += aggregared_clip_feat[:, None]
+        aggregated_feat_cnt_map[resized_mask_tensor_bchw[mask_idx, 0]] += 1
+    
+    aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None, :, :] + 1e-6)
+    aggregated_feat_map = F.interpolate(
+        aggregated_feat_map[None], 
+        (final_H, final_W), 
+        mode='bilinear', 
+        align_corners=False
+    )[0]
+    
+    np.save(obj_feat_path, aggregated_feat_map.cpu().detach().numpy())
+    return aggregated_feat_map
+
+def process_part_level_features(image, bbox_xyxy_list, clip_model, part_transform, device, part_feat_path, 
+                              small_H, small_W, final_H, final_W, part_batch_size):
+    """Process part-level CLIP features."""
+    cropped_image_list = []
+    for bbox_xyxy in bbox_xyxy_list:
+        crop_img = image[bbox_xyxy[1]:bbox_xyxy[3], bbox_xyxy[0]:bbox_xyxy[2]]
+        cropped_image_list.append(crop_img)
+    
+    image_tensor_list = []
+    for cropped_image in cropped_image_list:
+        if not isinstance(cropped_image, Image.Image):
+            cropped_image = Image.fromarray(cropped_image)
+        image_tensor = part_transform(cropped_image).unsqueeze(0).to(device)
+        image_tensor_list.append(image_tensor)
+    
+    aggregared_features = []
+    for batch_idx in range(0, len(image_tensor_list), part_batch_size):
+        with torch.no_grad():
+            batch = image_tensor_list[batch_idx:batch_idx+part_batch_size]
+            batch = torch.cat(batch, dim=0)
+            features = clip_model(batch)
+            aggregared_features.append(features)
+    
+    aggregared_features = torch.cat(aggregared_features, dim=0)
+    
+    aggregated_feat_map = torch.zeros((clip_feat_shape, small_H, small_W), dtype=float, device=device)
+    aggregated_feat_cnt_map = torch.zeros((small_H, small_W), dtype=int, device=device)
+    
+    for obj_idx in range(len(image_tensor_list)):
+        resized_bbox = (bbox_xyxy_list[obj_idx] * (small_W / image.shape[1])).astype(int)
+        feat_h = int(resized_bbox[3] - resized_bbox[1])
+        feat_w = int(resized_bbox[2] - resized_bbox[0])
+        
+        resized_feature = F.interpolate(
+            aggregared_features[obj_idx].unsqueeze(0), 
+            (feat_h, feat_w), 
+            mode='bilinear', 
+            align_corners=False
+        )[0]
+        
+        aggregated_feat_map[:, resized_bbox[1]:resized_bbox[3], resized_bbox[0]:resized_bbox[2]] += resized_feature
+        aggregated_feat_cnt_map[resized_bbox[1]:resized_bbox[3], resized_bbox[0]:resized_bbox[2]] += 1
+    
+    aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None,:,:] + 1e-6)
+    aggregated_feat_map = F.interpolate(
+        aggregated_feat_map[None], 
+        (final_H, final_W), 
+        mode='bilinear', 
+        align_corners=False
+    )[0]
+    
+    np.save(part_feat_path, aggregated_feat_map.cpu().numpy())
+    return aggregated_feat_map
+
+def save_visualizations(image, sam_mask, input_boxes1, obj_feat_path, aggregated_feat_map):
+    """Save various visualizations for debugging and analysis."""
+    # Save SAM mask visualization
+    annotation = sam_mask
+    areas = torch.sum(annotation, dim=(1, 2))
+    sorted_indices = torch.argsort(areas, descending=True)
+    show_img = annotation[sorted_indices]
+    ann_img = show_anns(show_img)
+    save_img_path = obj_feat_path.replace('.npy', '_mask.png')
+    Image.fromarray((ann_img * 255).astype(np.uint8)).save(save_img_path)
+    
+    # Save bbox visualization
+    viz_img = image.copy()
+    bboxes_for_save = []
+    for bbox_idx in range(input_boxes1.shape[0]):
+        bbox = input_boxes1[bbox_idx]
+        bbox_xyxy = bbox.cpu().numpy().astype(int)
+        bboxes_for_save.append(bbox_xyxy)
+        cv2.rectangle(viz_img, (bbox_xyxy[0], bbox_xyxy[1]), (bbox_xyxy[2], bbox_xyxy[3]), (0, 255, 0), 2)
+        cv2.putText(viz_img, f'{bbox_idx}', (bbox_xyxy[0], bbox_xyxy[1]), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    save_img_path = obj_feat_path.replace('.npy', '_bbox.png')
+    Image.fromarray(viz_img).save(save_img_path)
+    
+    # Save bounding boxes as .npy
+    bbox_save_path = obj_feat_path.replace('.npy', '_bboxes.npy')
+    np.save(bbox_save_path, np.stack(bboxes_for_save))
+    
+    # Save PCA visualization
+    original_size = (image.shape[1], image.shape[0])
+    visualize_aggregated_feat_map(aggregated_feat_map, obj_feat_path.replace('.npy', '_clip_pca.png'), original_size)
+
+def main(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    yolo_iou = 0.9
+    yolo_conf = 0.4
+    
+    # Setup transforms and models
+    part_transform, raw_transform, dino_transform = setup_transforms(args)
+    clip_model, mobilesamv2, ObjAwareModel, predictor, dinov2 = setup_models(args, device)
+    
+    # Setup directories
     base_dir = args.source_path
     image_dir = os.path.join(base_dir, 'images')
     if not os.path.exists(image_dir):
         image_dir = os.path.join(base_dir, 'color')
     assert os.path.isdir(image_dir), f"Image directory {image_dir} does not exist."
-
-    # Use output directories from args
-    obj_clip_feat_dir = args.obj_clip_feat_dir
-    part_clip_feat_dir = args.part_clip_feat_dir
-    dinov2_feat_dir = args.dinov2_feat_dir
-
+    
+    # Get image paths
     image_paths = [os.path.join(image_dir, fn) for fn in os.listdir(image_dir)]
     image_paths = [fn for fn in image_paths if is_valid_image(fn)]
     image_paths.sort()
-
+    
     assert len(image_paths) > 0, f"No valid images found in {image_dir}."
     print(f"Found {len(image_paths)} images.")
-
+    
+    # Setup output paths
     obj_feat_path_list = []
     part_feat_path_list = []
     dinov2_feat_path_list = []
     for image_path in image_paths:
         feat_fn = os.path.splitext(os.path.basename(image_path))[0] + '.npy'
-        obj_feat_path = os.path.join(obj_clip_feat_dir, feat_fn)
-        part_feat_path = os.path.join(part_clip_feat_dir, feat_fn)
-        dinov2_feat_path = os.path.join(dinov2_feat_dir, feat_fn)
+        obj_feat_path = os.path.join(args.obj_clip_feat_dir, feat_fn)
+        part_feat_path = os.path.join(args.part_clip_feat_dir, feat_fn)
+        dinov2_feat_path = os.path.join(args.dinov2_feat_dir, feat_fn)
         obj_feat_path_list.append(obj_feat_path)
         part_feat_path_list.append(part_feat_path)
         dinov2_feat_path_list.append(dinov2_feat_path)
     
-    print("Loading DINOv2 model...")
-    dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-    dinov2 = dinov2.to(device)
-
+    # Process DINOv2 features
+    print("Processing DINOv2 features...")
     for i in trange(len(image_paths)):
-        image = Image.open(image_paths[i])
-        image = resize_image(image, args.dino_resolution)
-        image = dino_transform(image)[:3].unsqueeze(0)
-        image, target_H, target_W = interpolate_to_patch_size(image, dinov2.patch_size)
-        image = image.cuda()
-        with torch.no_grad():
-            features = dinov2.forward_features(image)["x_norm_patchtokens"][0]
-
-        features = features.cpu().numpy()
-
-        features_hwc = features.reshape((target_H // dinov2.patch_size, target_W // dinov2.patch_size, -1))
-        features_chw = features_hwc.transpose((2, 0, 1))
-
-        np.save(dinov2_feat_path_list[i], features_chw)
+        process_dinov2_features(image_paths[i], dinov2, dino_transform, device, dinov2_feat_path_list[i])
     
     del dinov2
     pytorch_gc()
-
-    # ======================
-    tmp_idx = 0
+    
+    # Process each image
     for i in trange(len(image_paths)):
-        image_file_path = image_paths[i]
-
-        image = cv2.imread(image_file_path)
-        # resize to longest edge
+        # Load and preprocess image
+        image = cv2.imread(image_paths[i])
         if max(image.shape[:2]) > args.sam_size:
             if image.shape[0] > image.shape[1]:
                 image = cv2.resize(image, (int(args.sam_size * image.shape[1] / image.shape[0]), args.sam_size))
             else:
                 image = cv2.resize(image, (args.sam_size, int(args.sam_size * image.shape[0] / image.shape[1])))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
+        
         raw_img_H, raw_img_W = image.shape[:2]
-
-        # part level
+        
+        # Calculate dimensions
         small_W = args.part_feat_res
         small_H = raw_img_H * small_W // raw_img_W
-
-        # obj level
         object_W = args.obj_feat_res
         object_H = raw_img_H * object_W // raw_img_W
-
         final_W = args.final_feat_res
         final_H = raw_img_H * final_W // raw_img_W
-
-        # ===== Object-aware Model =====
-        obj_results = ObjAwareModel(image, device=device, imgsz=args.sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
-
-        predictor.set_image(image)
-        input_boxes1 = obj_results[0].boxes.xyxy
-        input_boxes = input_boxes1.cpu().numpy()
-        input_boxes = predictor.transform.apply_boxes(input_boxes, predictor.original_size)
-        input_boxes = torch.from_numpy(input_boxes).cuda()
-        sam_mask=[]
-        image_embedding=predictor.features
-        image_embedding=torch.repeat_interleave(image_embedding, 320, dim=0)
-        prompt_embedding=mobilesamv2.prompt_encoder.get_dense_pe()
-        prompt_embedding=torch.repeat_interleave(prompt_embedding, 320, dim=0)
-        for (boxes,) in batch_iterator(320, input_boxes):
-            with torch.no_grad():
-                image_embedding=image_embedding[0:boxes.shape[0],:,:,:]
-                prompt_embedding=prompt_embedding[0:boxes.shape[0],:,:,:]
-                sparse_embeddings, dense_embeddings = mobilesamv2.prompt_encoder(
-                    points=None,
-                    boxes=boxes,
-                    masks=None,)
-                low_res_masks, _ = mobilesamv2.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=prompt_embedding,
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=False,
-                    simple_type=True,
-                )
-                low_res_masks=predictor.model.postprocess_masks(low_res_masks, predictor.input_size, predictor.original_size)
-                sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold)*1.0
-                sam_mask.append(sam_mask_pre.squeeze(1))
-
-        sam_mask=torch.cat(sam_mask)
-        # Visualize SAM mask
-        annotation = sam_mask
-        areas = torch.sum(annotation, dim=(1, 2))
-        sorted_indices = torch.argsort(areas, descending=True)
-        show_img = annotation[sorted_indices]
-        ann_img = show_anns(show_img)
-        save_img_path = obj_feat_path_list[i].replace('.npy', '_mask.png')
-        Image.fromarray((ann_img * 255).astype(np.uint8)).save(save_img_path)
-
-        # ===== Object-level CLIP feature =====
-        raw_input_image = raw_transform(Image.fromarray(image))
-        whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
-        clip_feat_shape = whole_image_feature.shape[0]
-
-        # Interpolate CLIP features to image size
-        resized_clip_feat_map_bchw = torch.nn.functional.interpolate(whole_image_feature.unsqueeze(0).float(),
-                                                                size=(object_H, object_W),
-                                                                mode='bilinear',
-                                                                align_corners=False)
-
-        mask_tensor_bchw = sam_mask.unsqueeze(1)
-
-        resized_mask_tensor_bchw = torch.nn.functional.interpolate(mask_tensor_bchw.float(),
-                                                                size=(object_H, object_W),
-                                                                mode='nearest').bool()
-
-        aggregated_feat_map = torch.zeros((clip_feat_shape, object_H, object_W), dtype=float, device=device)
-        aggregated_feat_cnt_map = torch.zeros((object_H, object_W), dtype=int, device=device)
-
-        for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
-            aggregared_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask_tensor_bchw[mask_idx, 0]]
-            aggregared_clip_feat = aggregared_clip_feat.mean(dim=1)
-
-            aggregated_feat_map[:, resized_mask_tensor_bchw[mask_idx, 0]] += aggregared_clip_feat[:, None]
-            aggregated_feat_cnt_map[resized_mask_tensor_bchw[mask_idx, 0]] += 1
-            
-        aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None, :, :] + 1e-6)
-        aggregated_feat_map = F.interpolate(aggregated_feat_map[None], (final_H, final_W), mode='bilinear', align_corners=False)[0]
-
-        np.save(obj_feat_path_list[i], aggregated_feat_map.cpu().detach().numpy())
-
-        # visualize bbox
-        viz_img = image.copy()
-        bboxes_for_save = []
-        for bbox_idx in range(input_boxes1.shape[0]):
-            bbox = input_boxes1[bbox_idx]
-            bbox_xyxy = bbox.cpu().numpy().astype(int)
-            bboxes_for_save.append(bbox_xyxy)
-            cv2.rectangle(viz_img, (bbox_xyxy[0], bbox_xyxy[1]), (bbox_xyxy[2], bbox_xyxy[3]), (0, 255, 0), 2)
-            cv2.putText(viz_img, f'{bbox_idx}', (bbox_xyxy[0], bbox_xyxy[1]), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        save_img_path = obj_feat_path_list[i].replace('.npy', '_bbox.png')
-        Image.fromarray(viz_img).save(save_img_path)
-        # Save bounding boxes as .npy
-        bbox_save_path = obj_feat_path_list[i].replace('.npy', '_bboxes.npy')
-        np.save(bbox_save_path, np.stack(bboxes_for_save))
-
-        # crop images from bbox
-        cropped_image_list = []
-        bbox_xyxy_list = []
-        for bbox_idx in range(input_boxes1.shape[0]):
-            bbox = input_boxes1[bbox_idx]
-            bbox_xyxy = bbox.cpu().numpy().astype(int)
-            bbox_xyxy_list.append(bbox_xyxy)
-            crop_img = image[bbox_xyxy[1]:bbox_xyxy[3], bbox_xyxy[0]:bbox_xyxy[2]]
-            cropped_image_list.append(crop_img)
-
-        image_tensor_list = []
-        for cropped_image in cropped_image_list:
-            if not isinstance(cropped_image, Image.Image):
-                cropped_image = Image.fromarray(cropped_image)
-            w, h = cropped_image.size
-            image_tensor = transform(cropped_image).unsqueeze(0).to(device)
-            image_tensor_list.append(image_tensor)
-
-        # ===== Part-level CLIP feature =====
-        aggregared_features = []
-        for batch_idx in range(0, len(image_tensor_list), args.part_batch_size):
-            with torch.no_grad():
-                batch = image_tensor_list[batch_idx:batch_idx+args.part_batch_size]
-                batch = torch.cat(batch, dim=0)
-                features = clip_model(batch)
-                aggregared_features.append(features)
-
-        aggregared_features = torch.cat(aggregared_features, dim=0)
-
-        aggregated_feat_map = torch.zeros((clip_feat_shape, small_H, small_W), dtype=float, device=device)
-        aggregated_feat_cnt_map = torch.zeros((small_H, small_W), dtype=int, device=device)
-
-        assert len(image_tensor_list) == aggregared_features.shape[0]
-
-        for obj_idx in range(len(image_tensor_list)):
-            resized_bbox = (bbox_xyxy_list[obj_idx] * (small_W / image.shape[1])).astype(int)
-            feat_h = int(resized_bbox[3] - resized_bbox[1])
-            feat_w = int(resized_bbox[2] - resized_bbox[0])
-
-            resized_feature = F.interpolate(aggregared_features[obj_idx].unsqueeze(0), (feat_h, feat_w), mode='bilinear', align_corners=False)[0]
-            aggregated_feat_map[:, resized_bbox[1]:resized_bbox[3], resized_bbox[0]:resized_bbox[2]] += resized_feature
-
-            aggregated_feat_cnt_map[resized_bbox[1]:resized_bbox[3], resized_bbox[0]:resized_bbox[2]] += 1
-
-        aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None,:,:] + 1e-6)
-        aggregated_feat_map = F.interpolate(aggregated_feat_map[None], (final_H, final_W), mode='bilinear', align_corners=False)[0]
-        aggregated_feat_map = aggregated_feat_map.cpu().numpy()
-
-        np.save(part_feat_path_list[i], aggregated_feat_map)
-
-        # Save the PCA visualization of the aggregated feature map
-        original_size = (image.shape[1], image.shape[0]) if isinstance(image, np.ndarray) else image.size
-        visualize_aggregated_feat_map(aggregated_feat_map, obj_feat_path_list[i].replace('.npy', '_clip_pca.png'), original_size)
+        
+        # Process SAM masks
+        sam_mask, input_boxes1 = process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou)
+        
+        # Process object-level features
+        aggregated_feat_map = process_object_level_features(
+            image, sam_mask, clip_model, raw_transform, device, 
+            obj_feat_path_list[i], final_H, final_W
+        )
+        
+        # Process part-level features
+        bbox_xyxy_list = [bbox.cpu().numpy().astype(int) for bbox in input_boxes1]
+        part_aggregated_feat_map = process_part_level_features(
+            image, bbox_xyxy_list, clip_model, part_transform, device,
+            part_feat_path_list[i], small_H, small_W, final_H, final_W,
+            args.part_batch_size
+        )
+        
+        # Save visualizations
+        save_visualizations(image, sam_mask, input_boxes1, obj_feat_path_list[i], aggregated_feat_map)
 
 if __name__ == "__main__":
     parser = ArgumentParser("Compute reference features for feature splatting")
