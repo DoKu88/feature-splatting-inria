@@ -61,6 +61,10 @@ def batch_iterator(batch_size: int, *args) -> Generator[List[Any], None, None]:
     for b in range(n_batches):
         yield [arg[b * batch_size : (b + 1) * batch_size] for arg in args]
 
+
+# maskclip_onnx is a library that allows us to use the CLIP model to extract features from images
+# it is a wrapper around the CLIP model that allows us to use it in a more convenient way
+# it is a PyTorch module that can be used in a similar way to a regular PyTorch model
 class MaskCLIPFeaturizer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -131,6 +135,11 @@ def setup_transforms(args):
         'dino_transform': dino_transform
     }
 
+# See the following for more details:
+# https://github.com/RogerQi/MobileSAMV2/blob/main/hubconf.py
+# This gives us the models used for mobilesamev2, objawaremodel, and predictor
+# Sam Predictor: https://github.com/RogerQi/MobileSAMV2/blob/main/mobilesamv2/predictor.py
+#   Predict masks for the given input prompts, using the currently set image
 def setup_models(args, device):
     """Initialize and setup all required models."""
     clip_model = MaskCLIPFeaturizer().cuda().eval()
@@ -167,6 +176,7 @@ def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_f
     
     np.save(dinov2_feat_path, features_chw)
 
+# Object Aware Model is a YOLO model that is used to detect objects in an image
 def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou, sam_size):
     """Process SAM masks for object detection."""
     obj_results = ObjAwareModel(image, device=device, imgsz=sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
@@ -205,7 +215,10 @@ def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo
     
     return torch.cat(sam_mask), input_boxes1
 
-def process_object_level_features(image, sam_mask, clip_model, raw_transform, device, obj_feat_path, object_H, object_W, final_H, final_W):
+# get the object-level clip feature
+# wrt each pixel, take the average of the clip features of all the objects that overlap with that pixel
+def process_object_level_features(image, sam_masks, clip_model, raw_transform, device, 
+                                  obj_feat_path, object_H, object_W, final_H, final_W):
     """Process object-level CLIP features."""
     raw_input_image = raw_transform(Image.fromarray(image))
     whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
@@ -219,7 +232,7 @@ def process_object_level_features(image, sam_mask, clip_model, raw_transform, de
         align_corners=False
     )
     
-    mask_tensor_bchw = sam_mask.unsqueeze(1)
+    mask_tensor_bchw = sam_masks.unsqueeze(1)
     resized_mask_tensor_bchw = torch.nn.functional.interpolate(
         mask_tensor_bchw.float(),
         size=(object_H, object_W),
@@ -229,6 +242,10 @@ def process_object_level_features(image, sam_mask, clip_model, raw_transform, de
     aggregated_feat_map = torch.zeros((clip_feat_shape, object_H, object_W), dtype=float, device=device)
     aggregated_feat_cnt_map = torch.zeros((object_H, object_W), dtype=int, device=device)
     
+    # for each object mask, aggregate the clip features and take the mean of all the pixels in the mask
+    # this average of the pixels in the mask is the object-level feature
+    # then we interpolate the object-level feature to the final resolution
+    # and save the object-level feature
     for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
         aggregared_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask_tensor_bchw[mask_idx, 0]]
         aggregared_clip_feat = aggregared_clip_feat.mean(dim=1)
@@ -236,6 +253,8 @@ def process_object_level_features(image, sam_mask, clip_model, raw_transform, de
         aggregated_feat_map[:, resized_mask_tensor_bchw[mask_idx, 0]] += aggregared_clip_feat[:, None]
         aggregated_feat_cnt_map[resized_mask_tensor_bchw[mask_idx, 0]] += 1
     
+    # wrt each pixle, take the average of the clip features of all the objects that overlap with that pixel
+    # in for loop we get a sum of all the clip features of all the objects that overlap with that pixel
     aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None, :, :] + 1e-6)
     aggregated_feat_map = F.interpolate(
         aggregated_feat_map[None], 
@@ -418,7 +437,7 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     dims = calculate_dimensions(image.shape, args)
     
     # Process SAM masks
-    sam_mask, input_boxes1 = process_sam_masks(
+    sam_masks, input_boxes1 = process_sam_masks(
         image, models['ObjAwareModel'], models['predictor'], 
         models['mobilesamv2'], device, yolo_conf, yolo_iou, args.sam_size
     )
@@ -430,7 +449,7 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     
     # Process object-level features
     aggregated_feat_map = process_object_level_features(
-        image, sam_mask, models['clip_model'], transforms['raw_transform'], 
+        image, sam_masks, models['clip_model'], transforms['raw_transform'], 
         device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
         dims['final_H'], dims['final_W']
     )
@@ -445,7 +464,7 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     
     # Save visualizations
     save_visualizations(
-        image, sam_mask, input_boxes1, 
+        image, sam_masks, input_boxes1, 
         output_paths['obj_feat_path'], aggregated_feat_map
     )
 
@@ -465,6 +484,7 @@ def main(args):
     obj_feat_path_list, part_feat_path_list, dinov2_feat_path_list = setup_output_paths(image_paths, args)
     
     # Process DINOv2 features
+    # Save the DINOv2 features for each image within a .npy file 
     print("Processing DINOv2 features...")
     for i in trange(len(image_paths)):
         process_dinov2_features(
