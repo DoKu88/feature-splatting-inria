@@ -15,6 +15,7 @@ import torchvision.transforms as T
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import maskclip_onnx
+from sklearn.decomposition import PCA
 
 def resize_image(img, longest_edge):
     # resize to have the longest edge equal to longest_edge
@@ -77,6 +78,28 @@ class MaskCLIPFeaturizer(nn.Module):
         features = self.model.get_patch_encodings(img).to(torch.float32)
         return features.reshape(b, patch_h, patch_w, -1).permute(0, 3, 1, 2)
 
+def visualize_aggregated_feat_map(aggregated_feat_map, save_path, original_size=None):
+    # Reshape the feature map to (num_features, height * width)
+    num_features, height, width = aggregated_feat_map.shape
+    reshaped_feat_map = aggregated_feat_map.reshape(num_features, -1).T
+
+    # Apply PCA to reduce to 3 components
+    pca = PCA(n_components=3)
+    pca_result = pca.fit_transform(reshaped_feat_map)
+
+    # Reshape PCA result back to (height, width, 3)
+    pca_image = pca_result.reshape(height, width, 3)
+
+    # Normalize the PCA image to 0-255 and convert to uint8
+    pca_image = (pca_image - pca_image.min()) / (pca_image.max() - pca_image.min())
+    pca_image = (pca_image * 255).astype(np.uint8)
+
+    # If original_size is provided, upsample to that size
+    img = Image.fromarray(pca_image)
+    if original_size is not None:
+        img = img.resize(original_size, Image.NEAREST)
+    img.save(save_path)
+
 def main(args):
     norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     yolo_iou = 0.9
@@ -112,12 +135,11 @@ def main(args):
     if not os.path.exists(image_dir):
         image_dir = os.path.join(base_dir, 'color')
     assert os.path.isdir(image_dir), f"Image directory {image_dir} does not exist."
-    obj_clip_feat_dir = os.path.join(base_dir, 'sam_clip_features')
-    os.makedirs(obj_clip_feat_dir, exist_ok=True)
-    part_clip_feat_dir = os.path.join(base_dir, 'part_level_features')
-    os.makedirs(part_clip_feat_dir, exist_ok=True)
-    dinov2_feat_dir = os.path.join(base_dir, 'dinov2_vits14')
-    os.makedirs(dinov2_feat_dir, exist_ok=True)
+
+    # Use output directories from args
+    obj_clip_feat_dir = args.obj_clip_feat_dir
+    part_clip_feat_dir = args.part_clip_feat_dir
+    dinov2_feat_dir = args.dinov2_feat_dir
 
     image_paths = [os.path.join(image_dir, fn) for fn in os.listdir(image_dir)]
     image_paths = [fn for fn in image_paths if is_valid_image(fn)]
@@ -323,9 +345,14 @@ def main(args):
 
         np.save(part_feat_path_list[i], aggregated_feat_map)
 
+        # Save the PCA visualization of the aggregated feature map
+        original_size = (image.shape[1], image.shape[0]) if isinstance(image, np.ndarray) else image.size
+        visualize_aggregated_feat_map(aggregated_feat_map, obj_feat_path_list[i].replace('.npy', '_clip_pca.png'), original_size)
+
 if __name__ == "__main__":
     parser = ArgumentParser("Compute reference features for feature splatting")
     parser.add_argument("--source_path", "-s", required=True, type=str)
+    parser.add_argument("--output_path", "-o", required=True, type=str, help="Directory to save all output files")
     parser.add_argument("--part_batch_size", type=int, default=32, help="Part-level CLIP inference batch size")
     parser.add_argument("--part_resolution", type=int, default=224, help="Part-level CLIP input image resolution")
     parser.add_argument("--sam_size", type=int, default=1024, help="Longest edge for MobileSAMV2 segmentation")
@@ -335,6 +362,15 @@ if __name__ == "__main__":
     parser.add_argument("--dino_resolution", type=int, default=800, help="Longest edge for DINOv2 feature generation")
     parser.add_argument("--mobilesamv2_encoder_name", type=str, default="mobilesamv2_efficientvit_l2", help="MobileSAMV2 encoder name")
     args = parser.parse_args()
+
+    # Ensure output directory and subdirectories exist
+    os.makedirs(args.output_path, exist_ok=True)
+    args.obj_clip_feat_dir = os.path.join(args.output_path, 'sam_clip_features')
+    os.makedirs(args.obj_clip_feat_dir, exist_ok=True)
+    args.part_clip_feat_dir = os.path.join(args.output_path, 'part_level_features')
+    os.makedirs(args.part_clip_feat_dir, exist_ok=True)
+    args.dinov2_feat_dir = os.path.join(args.output_path, 'dinov2_vits14')
+    os.makedirs(args.dinov2_feat_dir, exist_ok=True)
 
     with torch.no_grad():
         main(args)
