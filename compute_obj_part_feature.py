@@ -79,6 +79,11 @@ class MaskCLIPFeaturizer(nn.Module):
         return features.reshape(b, patch_h, patch_w, -1).permute(0, 3, 1, 2)
 
 def visualize_aggregated_feat_map(aggregated_feat_map, save_path, original_size=None):
+    """Visualize aggregated feature map using PCA."""
+    # Move tensor to CPU and convert to numpy
+    if torch.is_tensor(aggregated_feat_map):
+        aggregated_feat_map = aggregated_feat_map.cpu().numpy()
+    
     # Reshape the feature map to (num_features, height * width)
     num_features, height, width = aggregated_feat_map.shape
     reshaped_feat_map = aggregated_feat_map.reshape(num_features, -1).T
@@ -120,7 +125,11 @@ def setup_transforms(args):
         T.Normalize(mean=[0.5], std=[0.5]),
     ])
     
-    return part_transform, raw_transform, dino_transform
+    return {
+        'part_transform': part_transform,
+        'raw_transform': raw_transform,
+        'dino_transform': dino_transform
+    }
 
 def setup_models(args, device):
     """Initialize and setup all required models."""
@@ -133,12 +142,18 @@ def setup_models(args, device):
     dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
     dinov2 = dinov2.to(device)
     
-    return clip_model, mobilesamv2, ObjAwareModel, predictor, dinov2
+    return {
+        'clip_model': clip_model,
+        'mobilesamv2': mobilesamv2,
+        'ObjAwareModel': ObjAwareModel,
+        'predictor': predictor,
+        'dinov2': dinov2
+    }
 
-def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_feat_path):
+def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_feat_path, dino_resolution):
     """Process DINOv2 features for a single image."""
     image = Image.open(image_path)
-    image = resize_image(image, args.dino_resolution)
+    image = resize_image(image, dino_resolution)
     image = dino_transform(image)[:3].unsqueeze(0)
     image, target_H, target_W = interpolate_to_patch_size(image, dinov2.patch_size)
     image = image.cuda()
@@ -152,9 +167,9 @@ def process_dinov2_features(image_path, dinov2, dino_transform, device, dinov2_f
     
     np.save(dinov2_feat_path, features_chw)
 
-def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou):
+def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou, sam_size):
     """Process SAM masks for object detection."""
-    obj_results = ObjAwareModel(image, device=device, imgsz=args.sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
+    obj_results = ObjAwareModel(image, device=device, imgsz=sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
     
     predictor.set_image(image)
     input_boxes1 = obj_results[0].boxes.xyxy
@@ -190,7 +205,7 @@ def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo
     
     return torch.cat(sam_mask), input_boxes1
 
-def process_object_level_features(image, sam_mask, clip_model, raw_transform, device, obj_feat_path, final_H, final_W):
+def process_object_level_features(image, sam_mask, clip_model, raw_transform, device, obj_feat_path, object_H, object_W, final_H, final_W):
     """Process object-level CLIP features."""
     raw_input_image = raw_transform(Image.fromarray(image))
     whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
@@ -233,7 +248,7 @@ def process_object_level_features(image, sam_mask, clip_model, raw_transform, de
     return aggregated_feat_map
 
 def process_part_level_features(image, bbox_xyxy_list, clip_model, part_transform, device, part_feat_path, 
-                              small_H, small_W, final_H, final_W, part_batch_size):
+                              small_H, small_W, final_H, final_W, part_batch_size, clip_feat_shape):
     """Process part-level CLIP features."""
     cropped_image_list = []
     for bbox_xyxy in bbox_xyxy_list:
@@ -318,34 +333,40 @@ def save_visualizations(image, sam_mask, input_boxes1, obj_feat_path, aggregated
     original_size = (image.shape[1], image.shape[0])
     visualize_aggregated_feat_map(aggregated_feat_map, obj_feat_path.replace('.npy', '_clip_pca.png'), original_size)
 
-def main(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    yolo_iou = 0.9
-    yolo_conf = 0.4
-    
-    # Setup transforms and models
-    part_transform, raw_transform, dino_transform = setup_transforms(args)
-    clip_model, mobilesamv2, ObjAwareModel, predictor, dinov2 = setup_models(args, device)
-    
-    # Setup directories
-    base_dir = args.source_path
+def setup_directories(args):
+    """Setup all necessary directories for output."""
+    os.makedirs(args.output_path, exist_ok=True)
+    args.obj_clip_feat_dir = os.path.join(args.output_path, 'sam_clip_features')
+    os.makedirs(args.obj_clip_feat_dir, exist_ok=True)
+    args.part_clip_feat_dir = os.path.join(args.output_path, 'part_level_features')
+    os.makedirs(args.part_clip_feat_dir, exist_ok=True)
+    args.dinov2_feat_dir = os.path.join(args.output_path, 'dinov2_vits14')
+    os.makedirs(args.dinov2_feat_dir, exist_ok=True)
+    return args
+
+def get_image_directory(base_dir):
+    """Get the image directory path, handling different possible locations."""
     image_dir = os.path.join(base_dir, 'images')
     if not os.path.exists(image_dir):
         image_dir = os.path.join(base_dir, 'color')
     assert os.path.isdir(image_dir), f"Image directory {image_dir} does not exist."
-    
-    # Get image paths
+    return image_dir
+
+def get_image_paths(image_dir):
+    """Get sorted list of valid image paths from directory."""
     image_paths = [os.path.join(image_dir, fn) for fn in os.listdir(image_dir)]
     image_paths = [fn for fn in image_paths if is_valid_image(fn)]
     image_paths.sort()
-    
     assert len(image_paths) > 0, f"No valid images found in {image_dir}."
     print(f"Found {len(image_paths)} images.")
-    
-    # Setup output paths
+    return image_paths
+
+def setup_output_paths(image_paths, args):
+    """Setup output paths for all features."""
     obj_feat_path_list = []
     part_feat_path_list = []
     dinov2_feat_path_list = []
+    
     for image_path in image_paths:
         feat_fn = os.path.splitext(os.path.basename(image_path))[0] + '.npy'
         obj_feat_path = os.path.join(args.obj_clip_feat_dir, feat_fn)
@@ -355,54 +376,116 @@ def main(args):
         part_feat_path_list.append(part_feat_path)
         dinov2_feat_path_list.append(dinov2_feat_path)
     
+    return obj_feat_path_list, part_feat_path_list, dinov2_feat_path_list
+
+def preprocess_image(image_path, sam_size):
+    """Load and preprocess an image for SAM processing."""
+    image = cv2.imread(image_path)
+    if max(image.shape[:2]) > sam_size:
+        if image.shape[0] > image.shape[1]:
+            image = cv2.resize(image, (int(sam_size * image.shape[1] / image.shape[0]), sam_size))
+        else:
+            image = cv2.resize(image, (sam_size, int(sam_size * image.shape[0] / image.shape[1])))
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
+
+def calculate_dimensions(image_shape, args):
+    """Calculate all necessary dimensions for feature processing."""
+    raw_img_H, raw_img_W = image_shape[:2]
+    
+    small_W = args.part_feat_res
+    small_H = raw_img_H * small_W // raw_img_W
+    
+    object_W = args.obj_feat_res
+    object_H = raw_img_H * object_W // raw_img_W
+    
+    final_W = args.final_feat_res
+    final_H = raw_img_H * final_W // raw_img_W
+    
+    return {
+        'small_H': small_H,
+        'small_W': small_W,
+        'object_H': object_H,
+        'object_W': object_W,
+        'final_H': final_H,
+        'final_W': final_W
+    }
+
+def process_single_image(image_path, args, models, transforms, device, yolo_conf, yolo_iou, output_paths):
+    """Process a single image through all feature extraction pipelines."""
+    # Load and preprocess image
+    image = preprocess_image(image_path, args.sam_size)
+    dims = calculate_dimensions(image.shape, args)
+    
+    # Process SAM masks
+    sam_mask, input_boxes1 = process_sam_masks(
+        image, models['ObjAwareModel'], models['predictor'], 
+        models['mobilesamv2'], device, yolo_conf, yolo_iou, args.sam_size
+    )
+    
+    # Get CLIP feature shape from a test forward pass
+    with torch.no_grad():
+        test_input = transforms['raw_transform'](Image.fromarray(image)).unsqueeze(0).cuda()
+        clip_feat_shape = models['clip_model'](test_input).shape[1]
+    
+    # Process object-level features
+    aggregated_feat_map = process_object_level_features(
+        image, sam_mask, models['clip_model'], transforms['raw_transform'], 
+        device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
+        dims['final_H'], dims['final_W']
+    )
+    
+    # Process part-level features
+    bbox_xyxy_list = [bbox.cpu().numpy().astype(int) for bbox in input_boxes1]
+    part_aggregated_feat_map = process_part_level_features(
+        image, bbox_xyxy_list, models['clip_model'], transforms['part_transform'],
+        device, output_paths['part_feat_path'], dims['small_H'], dims['small_W'],
+        dims['final_H'], dims['final_W'], args.part_batch_size, clip_feat_shape
+    )
+    
+    # Save visualizations
+    save_visualizations(
+        image, sam_mask, input_boxes1, 
+        output_paths['obj_feat_path'], aggregated_feat_map
+    )
+
+def main(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    yolo_iou = 0.9
+    yolo_conf = 0.4
+    
+    # Setup all necessary components
+    args = setup_directories(args)
+    transforms = setup_transforms(args)
+    models = setup_models(args, device)
+    
+    # Get image paths
+    image_dir = get_image_directory(args.source_path)
+    image_paths = get_image_paths(image_dir)
+    obj_feat_path_list, part_feat_path_list, dinov2_feat_path_list = setup_output_paths(image_paths, args)
+    
     # Process DINOv2 features
     print("Processing DINOv2 features...")
     for i in trange(len(image_paths)):
-        process_dinov2_features(image_paths[i], dinov2, dino_transform, device, dinov2_feat_path_list[i])
+        process_dinov2_features(
+            image_paths[i], models['dinov2'], transforms['dino_transform'],
+            device, dinov2_feat_path_list[i], args.dino_resolution
+        )
     
-    del dinov2
+    del models['dinov2']
     pytorch_gc()
     
     # Process each image
     for i in trange(len(image_paths)):
-        # Load and preprocess image
-        image = cv2.imread(image_paths[i])
-        if max(image.shape[:2]) > args.sam_size:
-            if image.shape[0] > image.shape[1]:
-                image = cv2.resize(image, (int(args.sam_size * image.shape[1] / image.shape[0]), args.sam_size))
-            else:
-                image = cv2.resize(image, (args.sam_size, int(args.sam_size * image.shape[0] / image.shape[1])))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        output_paths = {
+            'obj_feat_path': obj_feat_path_list[i],
+            'part_feat_path': part_feat_path_list[i]
+        }
         
-        raw_img_H, raw_img_W = image.shape[:2]
-        
-        # Calculate dimensions
-        small_W = args.part_feat_res
-        small_H = raw_img_H * small_W // raw_img_W
-        object_W = args.obj_feat_res
-        object_H = raw_img_H * object_W // raw_img_W
-        final_W = args.final_feat_res
-        final_H = raw_img_H * final_W // raw_img_W
-        
-        # Process SAM masks
-        sam_mask, input_boxes1 = process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo_conf, yolo_iou)
-        
-        # Process object-level features
-        aggregated_feat_map = process_object_level_features(
-            image, sam_mask, clip_model, raw_transform, device, 
-            obj_feat_path_list[i], final_H, final_W
+        process_single_image(
+            image_paths[i], args, models, transforms,
+            device, yolo_conf, yolo_iou, output_paths
         )
-        
-        # Process part-level features
-        bbox_xyxy_list = [bbox.cpu().numpy().astype(int) for bbox in input_boxes1]
-        part_aggregated_feat_map = process_part_level_features(
-            image, bbox_xyxy_list, clip_model, part_transform, device,
-            part_feat_path_list[i], small_H, small_W, final_H, final_W,
-            args.part_batch_size
-        )
-        
-        # Save visualizations
-        save_visualizations(image, sam_mask, input_boxes1, obj_feat_path_list[i], aggregated_feat_map)
 
 if __name__ == "__main__":
     parser = ArgumentParser("Compute reference features for feature splatting")
@@ -417,15 +500,6 @@ if __name__ == "__main__":
     parser.add_argument("--dino_resolution", type=int, default=800, help="Longest edge for DINOv2 feature generation")
     parser.add_argument("--mobilesamv2_encoder_name", type=str, default="mobilesamv2_efficientvit_l2", help="MobileSAMV2 encoder name")
     args = parser.parse_args()
-
-    # Ensure output directory and subdirectories exist
-    os.makedirs(args.output_path, exist_ok=True)
-    args.obj_clip_feat_dir = os.path.join(args.output_path, 'sam_clip_features')
-    os.makedirs(args.obj_clip_feat_dir, exist_ok=True)
-    args.part_clip_feat_dir = os.path.join(args.output_path, 'part_level_features')
-    os.makedirs(args.part_clip_feat_dir, exist_ok=True)
-    args.dinov2_feat_dir = os.path.join(args.output_path, 'dinov2_vits14')
-    os.makedirs(args.dinov2_feat_dir, exist_ok=True)
 
     with torch.no_grad():
         main(args)
