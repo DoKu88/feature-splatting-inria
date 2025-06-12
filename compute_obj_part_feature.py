@@ -279,34 +279,36 @@ def process_object_level_features_mask(image, sam_masks, clip_model, raw_transfo
         align_corners=False
     )
     
+    # Keep original mask resolution for sharp boundaries
     mask_tensor_bchw = sam_masks.unsqueeze(1)
-    resized_mask_tensor_bchw = torch.nn.functional.interpolate(
-        mask_tensor_bchw.float(),
-        size=(object_H, object_W),
-        mode='nearest'
-    ).bool()
     
     # Create a new feature map where each mask region will have its own unique CLIP embedding
     mask_feat_map = torch.zeros((clip_feat_shape, object_H, object_W), dtype=torch.float32, device=device)
     
     # For each mask, calculate its average CLIP embedding and assign it to the entire mask region
-    for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
-        # Get the mask region
-        mask_region = resized_mask_tensor_bchw[mask_idx, 0]
+    for mask_idx in range(mask_tensor_bchw.shape[0]):
+        # Get the mask region at original resolution
+        mask_region = mask_tensor_bchw[mask_idx, 0]
+        
+        # Resize mask to match feature map size
+        resized_mask = F.interpolate(
+            mask_region.float()[None, None], 
+            size=(object_H, object_W),
+            mode='nearest'
+        )[0, 0].bool()
         
         # Calculate average CLIP embedding for this mask region
-        mask_clip_feat = resized_clip_feat_map_bchw[0, :, mask_region]
-        mask_avg_feat = mask_clip_feat.mean(dim=1).to(torch.float32)  # Ensure float32 dtype
+        mask_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask]
+        mask_avg_feat = mask_clip_feat.mean(dim=1).to(torch.float32)
         
         # Assign this average embedding to the entire mask region
-        mask_feat_map[:, mask_region] = mask_avg_feat[:, None]
+        mask_feat_map[:, resized_mask] = mask_avg_feat[:, None]
     
-    # Interpolate to final resolution
+    # Use nearest neighbor interpolation for final resize to maintain sharp boundaries
     mask_feat_map = F.interpolate(
         mask_feat_map[None], 
         (final_H, final_W), 
-        mode='bilinear', 
-        align_corners=False
+        mode='nearest'
     )[0]
     
     np.save(obj_feat_path, mask_feat_map.cpu().detach().numpy())
