@@ -9,6 +9,8 @@ import cv2
 from typing import Any, Dict, Generator, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.profiler as profiler
+import time
 
 import torch.nn as nn
 import torchvision.transforms as T
@@ -507,41 +509,72 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     image = preprocess_image(image_path, args.sam_size)
     dims = calculate_dimensions(image.shape, args)
     
-    # Process SAM masks
-    sam_masks, input_boxes1 = process_sam_masks(
-        image, models['ObjAwareModel'], models['predictor'], 
-        models['mobilesamv2'], device, yolo_conf, yolo_iou, args.sam_size
-    )
+    # Setup profiler
+    activities = [
+        profiler.ProfilerActivity.CPU,
+        profiler.ProfilerActivity.CUDA,
+    ]
     
-    # Get CLIP feature shape from a test forward pass
-    with torch.no_grad():
-        test_input = transforms['raw_transform'](Image.fromarray(image)).unsqueeze(0).cuda()
-        clip_feat_shape = models['clip_model'](test_input).shape[1]
-    
-    # Process object-level features
-    aggregated_feat_map = process_object_level_features(
-        image, sam_masks, models['clip_model'], transforms['raw_transform'], 
-        device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
-        dims['final_H'], dims['final_W'], save
-    )
-    
-    # Process mask-level features and get sam_masks_clip
-    sam_masks_clip = process_object_level_features_mask(image, sam_masks, models['clip_model'], transforms['raw_transform'], device, 
-                                         output_paths['obj_feat_path'], dims['object_H'], dims['object_W'], dims['final_H'], dims['final_W'], save)
-    
-    if save:
-        # Visualize sam_masks_clip with PCA coloring
-        visualize_sam_masks_clip_pca(
-            sam_masks_clip,
-            image_shape=(image.shape[0], image.shape[1]),
-            save_path=output_paths['obj_feat_path'].replace('.npy', '_sam_masks_clip_pca.png'),
-        )
+    with profiler.profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        # Process SAM masks
+        with profiler.record_function("sam_masks"):
+            sam_masks, input_boxes1 = process_sam_masks(
+                image, models['ObjAwareModel'], models['predictor'], 
+                models['mobilesamv2'], device, yolo_conf, yolo_iou, args.sam_size
+            )
+        
+        # Get CLIP feature shape from a test forward pass
+        with profiler.record_function("clip_feature_shape"):
+            with torch.no_grad():
+                test_input = transforms['raw_transform'](Image.fromarray(image)).unsqueeze(0).cuda()
+                clip_feat_shape = models['clip_model'](test_input).shape[1]
+        
+        # Process object-level features
+        with profiler.record_function("object_level_features"):
+            aggregated_feat_map = process_object_level_features(
+                image, sam_masks, models['clip_model'], transforms['raw_transform'], 
+                device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
+                dims['final_H'], dims['final_W'], save
+            )
+        
+        # Process mask-level features and get sam_masks_clip
+        with profiler.record_function("mask_level_features"):
+            sam_masks_clip = process_object_level_features_mask(
+                image, sam_masks, models['clip_model'], transforms['raw_transform'], device, 
+                output_paths['obj_feat_path'], dims['object_H'], dims['object_W'], 
+                dims['final_H'], dims['final_W'], save
+            )
+        
+        if save:
+            # Visualize sam_masks_clip with PCA coloring
+            with profiler.record_function("visualize_pca"):
+                visualize_sam_masks_clip_pca(
+                    sam_masks_clip,
+                    image_shape=(image.shape[0], image.shape[1]),
+                    save_path=output_paths['obj_feat_path'].replace('.npy', '_sam_masks_clip_pca.png'),
+                )
 
-        # Save visualizations
-        save_visualizations(
-            image, sam_masks, input_boxes1, 
-            output_paths['obj_feat_path'], aggregated_feat_map
-        )
+            # Save visualizations
+            with profiler.record_function("save_visualizations"):
+                save_visualizations(
+                    image, sam_masks, input_boxes1, 
+                    output_paths['obj_feat_path'], aggregated_feat_map
+                )
+    
+    # Print profiling results
+    print(f"\nProfiling results for {os.path.basename(image_path)}:")
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total", row_limit=10
+    ))
+    
+    # Save profiling results to file
+    os.makedirs("profiler_traces", exist_ok=True)
+    prof.export_chrome_trace(f"profiler_traces/{os.path.basename(image_path)}_trace.json")
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
