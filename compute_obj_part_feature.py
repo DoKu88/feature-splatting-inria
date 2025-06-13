@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import maskclip_onnx
 from sklearn.decomposition import PCA
+import time
 
 def resize_image(img, longest_edge):
     # resize to have the longest edge equal to longest_edge
@@ -216,7 +217,7 @@ def process_sam_masks(image, ObjAwareModel, predictor, mobilesamv2, device, yolo
 # get the object-level clip feature
 # wrt each pixel, take the average of the clip features of all the objects that overlap with that pixel
 def process_object_level_features(image, sam_masks, clip_model, raw_transform, device, 
-                                  obj_feat_path, object_H, object_W, final_H, final_W):
+                                  obj_feat_path, object_H, object_W, final_H, final_W, save=True):
     """Process object-level CLIP features."""
     raw_input_image = raw_transform(Image.fromarray(image))
     whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
@@ -261,11 +262,12 @@ def process_object_level_features(image, sam_masks, clip_model, raw_transform, d
         align_corners=False
     )[0]
     
-    np.save(obj_feat_path, aggregated_feat_map.cpu().detach().numpy())
+    if save:
+        np.save(obj_feat_path, aggregated_feat_map.cpu().detach().numpy())
     return aggregated_feat_map
 
 def process_object_level_features_mask(image, sam_masks, clip_model, raw_transform, device, 
-                                     obj_feat_path, object_H, object_W, final_H, final_W):
+                                     obj_feat_path, object_H, object_W, final_H, final_W, save=True):
     """Process object-level CLIP features and return a list of [mask, clip_embedding] pairs."""
     raw_input_image = raw_transform(Image.fromarray(image))
     whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
@@ -297,11 +299,12 @@ def process_object_level_features_mask(image, sam_masks, clip_model, raw_transfo
         masks_list.append(mask.cpu().numpy())
         embeddings_list.append(mask_avg_feat)
     # Save as npz for later use
-    np.savez_compressed(
-        obj_feat_path.replace('.npy', '_sam_masks_clip.npz'),
-        masks=np.array(masks_list),
-        embeddings=np.array(embeddings_list)
-    )
+    if save:
+        np.savez_compressed(
+            obj_feat_path.replace('.npy', '_sam_masks_clip.npz'),
+            masks=np.array(masks_list),
+            embeddings=np.array(embeddings_list)
+        )
     # Return as list of pairs for downstream use
     sam_masks_clip = list(zip(masks_list, embeddings_list))
     return sam_masks_clip
@@ -498,7 +501,7 @@ def calculate_dimensions(image_shape, args):
         'final_W': final_W
     }
 
-def process_single_image(image_path, args, models, transforms, device, yolo_conf, yolo_iou, output_paths):
+def process_single_image(image_path, args, models, transforms, device, yolo_conf, yolo_iou, output_paths, save=False):
     """Process a single image through all feature extraction pipelines."""
     # Load and preprocess image
     image = preprocess_image(image_path, args.sam_size)
@@ -519,33 +522,26 @@ def process_single_image(image_path, args, models, transforms, device, yolo_conf
     aggregated_feat_map = process_object_level_features(
         image, sam_masks, models['clip_model'], transforms['raw_transform'], 
         device, output_paths['obj_feat_path'], dims['object_H'], dims['object_W'],
-        dims['final_H'], dims['final_W']
+        dims['final_H'], dims['final_W'], save
     )
     
     # Process mask-level features and get sam_masks_clip
     sam_masks_clip = process_object_level_features_mask(image, sam_masks, models['clip_model'], transforms['raw_transform'], device, 
-                                         output_paths['obj_feat_path'], dims['object_H'], dims['object_W'], dims['final_H'], dims['final_W'])
+                                         output_paths['obj_feat_path'], dims['object_H'], dims['object_W'], dims['final_H'], dims['final_W'], save)
     
-    # Visualize sam_masks_clip with PCA coloring
-    visualize_sam_masks_clip_pca(
-        sam_masks_clip,
-        image_shape=(image.shape[0], image.shape[1]),
-        save_path=output_paths['obj_feat_path'].replace('.npy', '_sam_masks_clip_pca.png')
-    )
-    
-    # Process part-level features
-    bbox_xyxy_list = [bbox.cpu().numpy().astype(int) for bbox in input_boxes1]
-    part_aggregated_feat_map = process_part_level_features(
-        image, bbox_xyxy_list, models['clip_model'], transforms['part_transform'],
-        device, output_paths['part_feat_path'], dims['small_H'], dims['small_W'],
-        dims['final_H'], dims['final_W'], args.part_batch_size, clip_feat_shape
-    )
-    
-    # Save visualizations
-    save_visualizations(
-        image, sam_masks, input_boxes1, 
-        output_paths['obj_feat_path'], aggregated_feat_map
-    )
+    if save:
+        # Visualize sam_masks_clip with PCA coloring
+        visualize_sam_masks_clip_pca(
+            sam_masks_clip,
+            image_shape=(image.shape[0], image.shape[1]),
+            save_path=output_paths['obj_feat_path'].replace('.npy', '_sam_masks_clip_pca.png'),
+        )
+
+        # Save visualizations
+        save_visualizations(
+            image, sam_masks, input_boxes1, 
+            output_paths['obj_feat_path'], aggregated_feat_map
+        )
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -568,11 +564,13 @@ def main(args):
             'obj_feat_path': obj_feat_path_list[i],
             'part_feat_path': part_feat_path_list[i]
         }
-        
+        start_time = time.time()
         process_single_image(
             image_paths[i], args, models, transforms,
             device, yolo_conf, yolo_iou, output_paths
         )
+        end_time = time.time()
+        print(f"Time taken for image {i}: {end_time - start_time} seconds")
 
 if __name__ == "__main__":
     parser = ArgumentParser("Compute reference features for feature splatting")
