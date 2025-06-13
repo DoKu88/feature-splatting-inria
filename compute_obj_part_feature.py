@@ -1,5 +1,5 @@
 import os
-from utils.general_utils import pytorch_gc
+#from utils.general_utils import pytorch_gc
 from argparse import ArgumentParser
 from PIL import Image
 import numpy as np
@@ -600,7 +600,7 @@ def main(args):
         start_time = time.time()
         process_single_image(
             image_paths[i], args, models, transforms,
-            device, yolo_conf, yolo_iou, output_paths
+            device, yolo_conf, yolo_iou, output_paths, args.save
         )
         end_time = time.time()
         print(f"Time taken for image {i}: {end_time - start_time} seconds")
@@ -616,6 +616,7 @@ if __name__ == "__main__":
     parser.add_argument("--part_feat_res", type=int, default=400, help="Intermediate (for MAP) SAM-enhanced Part-level feature resolution")
     parser.add_argument("--final_feat_res", type=int, default=64, help="Final hierarchical CLIP feature resolution")
     parser.add_argument("--mobilesamv2_encoder_name", type=str, default="mobilesamv2_efficientvit_l2", help="MobileSAMV2 encoder name")
+    parser.add_argument("--save", action="store_true", help="Save visualizations")
     args = parser.parse_args()
 
     with torch.no_grad():
